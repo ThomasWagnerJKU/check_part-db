@@ -1,0 +1,145 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# Part-DB monitoring plugins for Nagios/Naemon
+# Copyright (C) 2026 Thomas Wagner
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 2 as published
+# by the Free Software Foundation. It is distributed in the hope that it
+# will be useful, but WITHOUT ANY WARRANTY; without even the implied
+# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# LICENSE file for details.
+
+"""Nagios/Naemon plugin: health of a Part-DB instance via its REST API.
+
+Three things are verified, in order:
+  1. the API entrypoint answers      -> the application is up
+  2. the API token is accepted       -> authentication works
+  3. a collection query returns      -> the database behind it answers
+
+Exit codes follow the monitoring plugins guidelines.
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import part_db
+from part_db import OK, WARNING, CRITICAL, PluginError
+
+SHORTNAME = "PART-DB HEALTH"
+
+
+def parse_args():
+    parser = part_db.ArgumentParser(
+        prog="check_part-db-health",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Check that a Part-DB instance is up, authenticating and "
+                    "answering database backed queries.",
+        epilog="""
+Thresholds are in seconds and use the monitoring plugins range format,
+see https://www.monitoring-plugins.org/doc/guidelines.html#THRESHOLDFORMAT
+
+Examples:
+  Warn above 2s, alert above 5s total API time:
+    %(prog)s -H part-db.example.org -f /etc/naemon/part-db.token
+
+  Tighter limits and a shorter timeout:
+    %(prog)s -H part-db.example.org -f TOKEN -w 1 -c 3 -t 5
+
+  Part-DB served under a path prefix, on a non standard port:
+    %(prog)s -H part-db.example.org -p 8443 -u /partdb -f TOKEN
+""")
+    part_db.add_common_args(parser)
+    parser.add_argument("-w", "--warning", metavar="RANGE", default="2",
+                        help="Warning range for the total API response time "
+                             "in seconds (default: 2)")
+    parser.add_argument("-c", "--critical", metavar="RANGE", default="5",
+                        help="Critical range for the total API response time "
+                             "in seconds (default: 5)")
+    parser.add_argument("--probe-path", metavar="PATH", default="/api/parts",
+                        help="Collection queried to prove the database "
+                             "answers (default: /api/parts)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    plugin = part_db.Plugin(SHORTNAME)
+    warn = part_db.parse_range(args.warning)
+    crit = part_db.parse_range(args.critical)
+
+    api = part_db.api_from_args(args)
+
+    # 1 + 2: entrypoint proves the app runs and the token is accepted.
+    entry = api.get("/api")
+    if entry.status == 401:
+        plugin.add_status(CRITICAL, "API token rejected (HTTP 401)")
+        plugin.add_perfdata("api_time", round(entry.elapsed, 4), "s")
+        plugin.exit()
+    if entry.status == 403:
+        plugin.add_status(CRITICAL,
+                          "API token has no access to the entrypoint (HTTP 403)")
+        plugin.exit()
+    if entry.status >= 500:
+        plugin.add_status(CRITICAL, "Part-DB returned HTTP %s on /api "
+                                    "(application or backend error)"
+                          % entry.status)
+        plugin.exit()
+    if entry.status != 200:
+        plugin.add_status(CRITICAL,
+                          "unexpected HTTP %s on /api" % entry.status)
+        plugin.exit()
+
+    try:
+        collections = [key for key in entry.json()
+                       if not key.startswith("@")]
+    except PluginError:
+        plugin.add_status(CRITICAL,
+                          "/api did not return a usable API entrypoint document")
+        plugin.exit()
+
+    entry_time = entry.elapsed
+
+    # 3: a real query, so a broken or unreachable database is caught.
+    probe = api.get(args.probe_path, {"itemsPerPage": 1, "page": 1})
+    if probe.status >= 500:
+        plugin.add_status(CRITICAL,
+                          "database query %s failed with HTTP %s"
+                          % (args.probe_path, probe.status))
+        plugin.add_perfdata("api_time", round(entry_time, 4), "s")
+        plugin.exit()
+    if probe.status != 200:
+        plugin.add_status(CRITICAL, "query %s returned HTTP %s"
+                          % (args.probe_path, probe.status))
+        plugin.exit()
+
+    try:
+        items = part_db.total_items(probe.json(), args.probe_path)
+    except PluginError as exc:
+        plugin.add_status(CRITICAL, str(exc))
+        plugin.exit()
+
+    total_time = entry_time + probe.elapsed
+
+    plugin.check_and_report(
+        round(total_time, 3), warn, crit,
+        "API responding in {value}s, token valid, %d collections, "
+        "%d objects in %s" % (len(collections), items, args.probe_path))
+
+    plugin.add_perfdata("time", round(total_time, 4), "s",
+                        warn=warn, crit=crit, minimum=0)
+    plugin.add_perfdata("api_time", round(entry_time, 4), "s", minimum=0)
+    plugin.add_perfdata("query_time", round(probe.elapsed, 4), "s", minimum=0)
+    plugin.add_perfdata("collections", len(collections), minimum=0)
+
+    plugin.exit()
+
+
+if __name__ == "__main__":
+    part_db.run(main, SHORTNAME)
